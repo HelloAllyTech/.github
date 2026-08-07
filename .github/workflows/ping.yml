@@ -1,0 +1,8 @@
+name: Ping (reusable)
+on:
+  workflow_call:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "reusable workflow resolved"
