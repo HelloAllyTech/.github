@@ -1,0 +1,81 @@
+name: Docs guard (reusable)
+
+# Enforces a repo's .docs-map.yml against the files a PR changed, so documentation stays
+# in step with code instead of relying on everyone remembering.
+#
+# Call it from a repo with:
+#
+#   jobs:
+#     docs-guard:
+#       uses: helloallytech/.github/.github/workflows/docs-guard.yml@main
+#
+# Spec: https://tech.helloally.ai/#/wiki/contributing/docs-system.md
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: Python used to run the checker.
+        type: string
+        default: "3.12"
+      guard-ref:
+        description: Ref of helloallytech/.github to take the checker from.
+        type: string
+        default: main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out the shared checker
+        uses: actions/checkout@v4
+        with:
+          repository: helloallytech/.github
+          ref: ${{ inputs.guard-ref }}
+          path: .docs-guard
+          sparse-checkout: scripts
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - run: pip install --quiet pyyaml
+
+      - name: Collect changed files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git diff --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
+          echo "Changed files:"
+          sed 's/^/  /' changed-files.txt
+
+      - name: Capture PR body and labels
+        env:
+          # Via env, never interpolated into the script body — a PR description is
+          # attacker-controlled text and must not reach the shell as code.
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${PR_BODY:-}" > pr-body.txt
+          printf '%s' "${PR_LABELS:-}" > pr-labels.txt
+
+      - name: Run docs guard
+        run: |
+          set -euo pipefail
+          python3 .docs-guard/scripts/docs_guard.py \
+            --repo-root . \
+            --changed-files changed-files.txt \
+            --pr-body pr-body.txt \
+            --labels "$(cat pr-labels.txt)"
