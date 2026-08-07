@@ -1,0 +1,122 @@
+name: Probe B
+on:
+  workflow_call:
+
+jobs:
+#     docs-guard:
+#       uses: helloallytech/.github/.github/workflows/docs-guard.yml@main
+#
+# Spec: https://tech.helloally.ai/#/wiki/contributing/docs-system.md
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        description: Python used to run the checker.
+        type: string
+        default: "3.12"
+      guard_ref:
+        description: Ref of helloallytech/.github to take the checker from.
+        type: string
+        default: main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out the shared checker
+        uses: actions/checkout@v4
+        with:
+          repository: helloallytech/.github
+          ref: ${{ env.NOPE }}
+          path: .docs-guard
+          sparse-checkout: scripts
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ '3.12' }}
+
+      - run: pip install --quiet pyyaml
+
+      # A push that arrived through a pull request was already checked as that PR. Flagging
+      # it again would report every merge twice and teach people the guard cries wolf.
+      - name: Skip a push that already passed as a pull request
+        id: dedupe
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          merged="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '[.[] | select(.merged_at != null)] | length' 2>/dev/null || echo 0)"
+          if [ "${merged:-0}" -gt 0 ]; then
+            echo "Arrived via a merged pull request — already guarded there."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect changed files
+        if: steps.dedupe.outputs.skip != 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            BASE="$BASE_SHA"; HEAD="$HEAD_SHA"
+          else
+            HEAD="$GITHUB_SHA"
+            BASE="$PUSH_BEFORE"
+            # A first push, or a force-push, leaves `before` unreachable. Fall back to the
+            # head's parent so we check something real rather than the whole history.
+            if [ -z "${BASE:-}" ] || [ "${BASE//0/}" = "" ] \
+               || ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
+              BASE="${HEAD}^"
+            fi
+          fi
+          git diff --name-only --diff-filter=d "$BASE" "$HEAD" > changed-files.txt
+          git log --format=%B "$BASE..$HEAD" > commit-messages.txt || true
+          echo "Changed files:"
+          sed 's/^/  /' changed-files.txt
+
+      - name: Capture the escape hatches
+        if: steps.dedupe.outputs.skip != 'true'
+        env:
+          # Via env, never interpolated into the script body — a PR description is
+          # attacker-controlled text and must not reach the shell as code.
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            printf '%s' "${PR_BODY:-}" > pr-body.txt
+            printf '%s' "${PR_LABELS:-}" > pr-labels.txt
+          else
+            # A direct push has no description and no labels, so the trailers live in the
+            # commit message — the same forms the pre-push hook reads.
+            cp commit-messages.txt pr-body.txt
+            if grep -qiE '^[[:space:]]*Docs-Skip:[[:space:]]*\S' pr-body.txt; then
+              printf 'docs:skip' > pr-labels.txt
+            else
+              : > pr-labels.txt
+            fi
+          fi
+
+      - name: Run docs guard
+        if: steps.dedupe.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          python3 .docs-guard/scripts/docs_guard.py \
+            --repo-root . \
+            --changed-files changed-files.txt \
+            --pr-body pr-body.txt \
+            --labels "$(cat pr-labels.txt)"
