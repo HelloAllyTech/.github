@@ -1,9 +1,28 @@
 name: Docs guard (reusable)
 
-# Enforces a repo's .docs-map.yml against the files a PR changed, so documentation stays
-# in step with code instead of relying on everyone remembering.
+# Enforces a repo's .docs-map.yml against the files a change touched, so documentation
+# stays in step with code instead of relying on everyone remembering.
+#
+# Handles both ways work lands here:
+#
+#   pull_request — the original gate. Escape hatches are the `docs:skip` label and a
+#                  `Wiki-PR:` trailer in the PR body.
+#   push         — most commits go straight to the default branch and never open a PR, so
+#                  the guard would never see them. It cannot block something already
+#                  pushed; a red mark on the commit and a notification to its author are
+#                  the nudge. Trailers come from the commit message instead, and a push
+#                  that arrived via a merged PR is skipped so nothing is reported twice.
+#
+# The pre-push hook in hooks/ runs the same checker before the push, which is the last
+# point it can still change what you do.
 #
 # Call it from a repo with:
+#
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+#     push:
+#       branches: [master]
 #
 #   jobs:
 #     docs-guard:
@@ -50,17 +69,49 @@ jobs:
 
       - run: pip install --quiet pyyaml
 
+      # A push that arrived through a pull request was already checked as that PR. Flagging
+      # it again would report every merge twice and teach people the guard cries wolf.
+      - name: Skip a push that already passed as a pull request
+        id: dedupe
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          merged="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '[.[] | select(.merged_at != null)] | length' 2>/dev/null || echo 0)"
+          if [ "${merged:-0}" -gt 0 ]; then
+            echo "Arrived via a merged pull request — already guarded there."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Collect changed files
+        if: steps.dedupe.outputs.skip != 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
-          git diff --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            BASE="$BASE_SHA"; HEAD="$HEAD_SHA"
+          else
+            HEAD="$GITHUB_SHA"
+            BASE="$PUSH_BEFORE"
+            # A first push, or a force-push, leaves `before` unreachable. Fall back to the
+            # head's parent so we check something real rather than the whole history.
+            if [ -z "${BASE:-}" ] || [ "${BASE//0/}" = "" ] \
+               || ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
+              BASE="${HEAD}^"
+            fi
+          fi
+          git diff --name-only --diff-filter=d "$BASE" "$HEAD" > changed-files.txt
+          git log --format=%B "$BASE..$HEAD" > commit-messages.txt || true
           echo "Changed files:"
           sed 's/^/  /' changed-files.txt
 
-      - name: Capture PR body and labels
+      - name: Capture the escape hatches
+        if: steps.dedupe.outputs.skip != 'true'
         env:
           # Via env, never interpolated into the script body — a PR description is
           # attacker-controlled text and must not reach the shell as code.
@@ -68,10 +119,22 @@ jobs:
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
           set -euo pipefail
-          printf '%s' "${PR_BODY:-}" > pr-body.txt
-          printf '%s' "${PR_LABELS:-}" > pr-labels.txt
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            printf '%s' "${PR_BODY:-}" > pr-body.txt
+            printf '%s' "${PR_LABELS:-}" > pr-labels.txt
+          else
+            # A direct push has no description and no labels, so the trailers live in the
+            # commit message — the same forms the pre-push hook reads.
+            cp commit-messages.txt pr-body.txt
+            if grep -qiE '^[[:space:]]*Docs-Skip:[[:space:]]*\S' pr-body.txt; then
+              printf 'docs:skip' > pr-labels.txt
+            else
+              : > pr-labels.txt
+            fi
+          fi
 
       - name: Run docs guard
+        if: steps.dedupe.outputs.skip != 'true'
         run: |
           set -euo pipefail
           python3 .docs-guard/scripts/docs_guard.py \
