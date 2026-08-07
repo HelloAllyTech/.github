@@ -19,30 +19,59 @@ die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 ok()  { printf '\033[32m%s\033[0m\n' "$*"; }
 
 GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)" || die "not a git repository."
-HOOKS_DIR="$GIT_DIR/hooks"
-TARGET="$HOOKS_DIR/pre-push"
 
-# core.hooksPath wins over .git/hooks, so installing into .git/hooks would silently do
-# nothing. Say so rather than leaving someone with a hook that never fires.
-CUSTOM_PATH="$(git config --get core.hooksPath || true)"
-if [[ -n "$CUSTOM_PATH" ]]; then
-  HOOKS_DIR="$CUSTOM_PATH"
-  TARGET="$HOOKS_DIR/pre-push"
-  printf 'This repo sets core.hooksPath=%s — installing there instead.\n' "$CUSTOM_PATH"
+# Husky owns core.hooksPath and regenerates everything under .husky/_, so writing there is
+# both temporary and destructive: its pre-push file is the dispatcher that runs every other
+# husky hook. The file a project is meant to own is .husky/<hookname>.
+HOOKS_PATH="$(git config --get core.hooksPath || true)"
+if [[ -d .husky ]] || [[ "$HOOKS_PATH" == .husky/_* ]]; then
+  MODE="husky"
+  TARGET=".husky/pre-push"
+  mkdir -p .husky
+elif [[ -n "$HOOKS_PATH" ]]; then
+  MODE="plain"
+  TARGET="$HOOKS_PATH/pre-push"
+  mkdir -p "$HOOKS_PATH"
+  printf 'This repo sets core.hooksPath=%s — installing there.\n' "$HOOKS_PATH"
+else
+  MODE="plain"
+  TARGET="$GIT_DIR/hooks/pre-push"
+  mkdir -p "$GIT_DIR/hooks"
 fi
 
-mkdir -p "$HOOKS_DIR"
-
-if [[ -e "$TARGET" ]] && ! grep -q "docs_guard.py" "$TARGET" 2>/dev/null; then
-  cp "$TARGET" "$TARGET.replaced-by-docs-guard"
-  printf 'Existing pre-push hook saved as %s\n' "$TARGET.replaced-by-docs-guard"
+# Never silently replace a hook we did not write.
+if [[ -e "$TARGET" ]] && ! grep -q "ally-docs-guard" "$TARGET" 2>/dev/null; then
+  die "$TARGET already exists and was not installed by us.
+    Move it aside and re-run, or chain to $HOOK_URL from within it."
 fi
 
-curl -fsSL --max-time 10 "$HOOK_URL" -o "$TARGET.tmp" || die "could not download the hook."
-mv "$TARGET.tmp" "$TARGET"
+if [[ "$MODE" == "husky" ]]; then
+  # A shim rather than a copy: the logic stays canonical in helloallytech/.github, and
+  # because .husky/pre-push is committed, the whole team gets it without running anything.
+  cat > "$TARGET" <<SHIM
+#!/usr/bin/env bash
+# ally-docs-guard — checks .docs-map.yml before a push to the default branch.
+# Canonical source: $HOOK_URL
+# Caches into .git/docs-guard/, refreshes daily, and never blocks on its own failures.
+set -u
+CACHE="\$(git rev-parse --git-dir)/docs-guard/pre-push"
+if [ ! -f "\$CACHE" ] || [ -n "\$(find "\$CACHE" -mmin +1440 2>/dev/null)" ]; then
+  mkdir -p "\$(dirname "\$CACHE")"
+  curl -fsSL --max-time 5 "$HOOK_URL" -o "\$CACHE.tmp" 2>/dev/null \\
+    && mv "\$CACHE.tmp" "\$CACHE" || rm -f "\$CACHE.tmp"
+fi
+[ -f "\$CACHE" ] || exit 0
+command -v bash >/dev/null 2>&1 || exit 0
+exec bash "\$CACHE"
+SHIM
+else
+  curl -fsSL --max-time 10 "$HOOK_URL" -o "$TARGET.tmp" || die "could not download the hook."
+  mv "$TARGET.tmp" "$TARGET"
+fi
+
 chmod +x "$TARGET"
-
 ok "Installed the docs-guard pre-push hook at $TARGET"
+[[ "$MODE" == "husky" ]] && printf 'Commit %s so the rest of the team gets it too.\n' "$TARGET"
 
 if [[ ! -f .docs-map.yml ]]; then
   printf '\nNote: this repo has no .docs-map.yml, so the hook will stay silent until it does.\n'

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The docs guard, at the last moment it can still change what you do.
+# ally-docs-guard — the docs guard, at the last moment it can still change what you do.
 #
 # Most changes on this platform go straight to the default branch — 73% of commits in
 # ally-be and ally-ai-learn, 95% in ally-mobile. The CI guard only runs on pull requests,
