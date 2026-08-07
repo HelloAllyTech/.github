@@ -26,7 +26,7 @@ name: Docs guard (reusable)
 #
 #   jobs:
 #     docs-guard:
-#       uses: helloallytech/.github/.github/workflows/docs-guard.yml@main
+#       uses: helloallytech/.github/.github/workflows/docs-guard-reusable.yml@main
 #
 # Spec: https://tech.helloally.ai/#/wiki/contributing/docs-system.md
 
