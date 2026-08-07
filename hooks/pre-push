@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# The docs guard, at the last moment it can still change what you do.
+#
+# Most changes on this platform go straight to the default branch — 73% of commits in
+# ally-be and ally-ai-learn, 95% in ally-mobile. The CI guard only runs on pull requests,
+# so it never sees them. This runs the same checker against the same .docs-map.yml rules,
+# just before the push leaves your machine, which in trunk-based work is the last moment
+# the docs can still land in the same beat as the code.
+#
+# It is a nudge, not a wall:
+#   * `git push --no-verify` always wins.
+#   * Anything wrong with the tooling lets the push through. A hook that blocks you because
+#     pyyaml is missing is a hook you will uninstall.
+#   * It only looks at pushes to the default branch. Feature-branch pushes are silent —
+#     the docs can legitimately come later in the PR.
+#
+# On a direct push there is no PR description, so the trailers live in the commit message:
+#   Wiki-PR: <url of the wiki PR>      satisfies a `wiki:` rule
+#   Wiki-PR: none — <reason>           waives one, on the record
+#   Docs-Skip: <reason>                the commit-message form of the `docs:skip` label
+#
+# Install, from any code repo:
+#   curl -fsSL https://raw.githubusercontent.com/HelloAllyTech/.github/main/hooks/install.sh | bash
+#
+# Spec: https://tech.helloally.ai/#/wiki/contributing/docs-system.md
+
+set -uo pipefail
+
+GUARD_URL="https://raw.githubusercontent.com/HelloAllyTech/.github/main/scripts/docs_guard.py"
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
+CACHE_DIR="$GIT_DIR/docs-guard"
+GUARD="$CACHE_DIR/docs_guard.py"
+STALE_MINUTES=1440
+
+note() { printf '\033[36mdocs guard:\033[0m %s\n' "$*" >&2; }
+
+# No rules in this repo means nothing to enforce.
+[[ -f .docs-map.yml ]] || exit 0
+
+# Never fall back to init.defaultBranch: that is the developer's global preference, not this
+# repo's branch. A machine set to `main` would silently never fire in a `master` repo, and a
+# nudge that quietly does nothing is worse than no nudge at all.
+DEFAULT_BRANCH="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+if [[ -z "$DEFAULT_BRANCH" ]]; then
+  for candidate in master main trunk; do
+    if git show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
+      DEFAULT_BRANCH="$candidate"
+      break
+    fi
+  done
+fi
+[[ -n "$DEFAULT_BRANCH" ]] || exit 0
+
+# ------------------------------------------------- what is actually being pushed to trunk
+
+CHANGED_FILE="$(mktemp)"; BODY_FILE="$(mktemp)"
+trap 'rm -f "$CHANGED_FILE" "$BODY_FILE"' EXIT
+
+while read -r _local_ref local_sha remote_ref remote_sha; do
+  [[ "$remote_ref" == "refs/heads/$DEFAULT_BRANCH" ]] || continue
+  [[ "$local_sha" =~ ^0+$ ]] && continue                     # deleting the branch
+
+  if [[ "$remote_sha" =~ ^0+$ ]]; then
+    base="${local_sha}^"                                     # nothing upstream yet
+  else
+    base="$remote_sha"
+  fi
+
+  git diff --name-only --diff-filter=d "$base" "$local_sha" 2>/dev/null >> "$CHANGED_FILE"
+  git log --format=%B "$base..$local_sha" 2>/dev/null >> "$BODY_FILE"
+done
+
+sort -u -o "$CHANGED_FILE" "$CHANGED_FILE"
+[[ -s "$CHANGED_FILE" ]] || exit 0
+
+# --------------------------------------------------------------- best-effort tooling setup
+
+command -v python3 >/dev/null 2>&1 || exit 0
+python3 -c "import yaml" 2>/dev/null || {
+  note "skipped — python3 has no pyyaml (pip install pyyaml to enable this check)."
+  exit 0
+}
+
+mkdir -p "$CACHE_DIR" 2>/dev/null
+if [[ ! -f "$GUARD" ]] || [[ -n "$(find "$GUARD" -mmin +$STALE_MINUTES 2>/dev/null)" ]]; then
+  curl -fsSL --max-time 5 "$GUARD_URL" -o "$GUARD.tmp" 2>/dev/null \
+    && mv "$GUARD.tmp" "$GUARD" \
+    || rm -f "$GUARD.tmp"
+fi
+[[ -f "$GUARD" ]] || {
+  note "skipped — could not fetch the shared checker, and no cached copy exists."
+  exit 0
+}
+
+# `docs:skip` is a PR label and there is no PR yet, so accept the commit-message form.
+LABELS=""
+grep -qiE '^[[:space:]]*Docs-Skip:[[:space:]]*\S' "$BODY_FILE" && LABELS="docs:skip"
+
+# ------------------------------------------------------------------------------- the check
+
+OUTPUT="$(python3 "$GUARD" \
+  --repo-root . \
+  --changed-files "$CHANGED_FILE" \
+  --pr-body "$BODY_FILE" \
+  --labels "$LABELS" 2>&1)"
+STATUS=$?
+
+[[ $STATUS -eq 0 ]] && exit 0
+
+printf '%s\n' "$OUTPUT" | grep -v '^::' >&2
+cat >&2 <<'EOF'
+
+On a direct push the escape hatches live in the commit message, not on a PR:
+
+    git commit --amend -m "$(git log -1 --format=%B)
+    Docs-Skip: <why this change moves no doc>"
+
+Or push anyway with:  git push --no-verify
+EOF
+exit 1
