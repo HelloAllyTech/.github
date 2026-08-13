@@ -104,9 +104,14 @@ jq -n \
 echo "Dispatch payload:"
 cat payload.json
 
+# `gh api -F key=@file` reads the file as a raw string, not JSON — it would send
+# client_payload as an escaped string rather than an object and the API rejects it.
+# Build the whole request body with jq instead and send it as-is.
+jq -n --slurpfile payload payload.json \
+  '{event_type: "new-entry", client_payload: $payload[0]}' > dispatch-body.json
+
 GH_TOKEN="$CHANGELOG_DISPATCH_TOKEN" gh api \
   "repos/HelloAllyTech/ally-changelog/dispatches" \
-  -f event_type=new-entry \
-  -F "client_payload=@payload.json"
+  --input dispatch-body.json
 
 echo "Dispatched changelog entry for ${REPO_FULL}@${AFTER_SHA}"
