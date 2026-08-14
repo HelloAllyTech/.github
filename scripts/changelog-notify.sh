@@ -31,9 +31,22 @@ TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 COMPARE_URL="https://github.com/${REPO_FULL}/compare/${BEFORE_SHA}...${AFTER_SHA}"
 
 # Was AFTER the merge commit of a merged PR? Read-only lookup against this repo's own
-# API, using the default token — no cross-repo access needed for this part.
-PR_JSON="$(GH_TOKEN="$GITHUB_TOKEN" gh api "repos/${REPO_FULL}/commits/${AFTER_SHA}/pulls" \
-  --jq '[.[] | select(.merged_at != null)] | .[0] // empty' 2>/dev/null || true)"
+# API, using the default token — no cross-repo access needed for this part. This endpoint
+# has a brief eventual-consistency lag right after a merge, so retry a couple of times
+# before giving up. Critically: check gh's own exit code, don't just look at whether
+# stdout came back non-empty — on a 404 or any other error, `gh api` still writes its
+# JSON error body (e.g. {"message":"Not Found",...}) to *stdout*, and blindly trusting
+# that as if it were PR data produced a real broken entry (all-null PR fields) the first
+# time this ran in production.
+PR_JSON=""
+for attempt in 1 2 3; do
+  if PR_LIST="$(GH_TOKEN="$GITHUB_TOKEN" gh api "repos/${REPO_FULL}/commits/${AFTER_SHA}/pulls" 2>/dev/null)"; then
+    PR_JSON="$(echo "$PR_LIST" | jq '[.[] | select(.merged_at != null)] | .[0] // empty')"
+    break
+  fi
+  echo "PR lookup failed (attempt ${attempt}), retrying shortly..."
+  sleep 3
+done
 
 if [ -n "$PR_JSON" ]; then
   PR_ARGS=(--argjson pr "$(echo "$PR_JSON" | jq '{number, title, body: (.body // ""), url: .html_url, author: .user.login}')")
