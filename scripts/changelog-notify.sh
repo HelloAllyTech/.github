@@ -7,7 +7,7 @@
 # not six — the same pattern docs.yml uses for docs_guard.py.
 #
 # Required env:
-#   GITHUB_REPOSITORY        set by Actions automatically ("HelloAllyTech/ally-be")
+#   GITHUB_REPOSITORY        set by Actions automatically ("HelloAllyTech/ally-platform")
 #   GITHUB_TOKEN              default token, read-only access to *this* repo's own API
 #   BEFORE_SHA, AFTER_SHA     the push event's before/after commits
 #   CHANGELOG_DISPATCH_TOKEN  PAT scoped to ally-changelog only, for the dispatch call
@@ -88,6 +88,30 @@ for prefix, name in [
 ]:
     if any(f.startswith(prefix) for f in files):
         apps.append(name)
+print(json.dumps(apps))
+' <<<"$CHANGED_FILES")"
+fi
+
+# ally-platform (the monorepo since 2026-10-23) holds every service as a folder, so the
+# repo name alone no longer says what shipped. Name each service folder the push touched,
+# and ally-web's apps by name as above. ally-be's product-update ingest reads these names
+# from the entry header when it cannot get the PR's file list.
+if [ "$REPO" = "ally-platform" ]; then
+  CHANGED_FILES="$(git diff --name-only "${BEFORE_SHA}..${AFTER_SHA}" 2>/dev/null || true)"
+  CHANGED_APPS_JSON="$(python3 -c '
+import json, sys
+files = sys.stdin.read().splitlines()
+apps = []
+for service in ["ally-be", "ally-ai", "ally-ai-learn", "ally-mobile"]:
+    if any(f.startswith(service + "/") for f in files):
+        apps.append(service)
+web = [f[len("ally-web/"):] for f in files if f.startswith("ally-web/")]
+web_apps = [
+    name
+    for name in ["ally-web", "ally-admin-dashboard", "ally-helpline-dashboard"]
+    if any(f.startswith("apps/" + name + "/") for f in web)
+]
+apps += web_apps or (["ally-web"] if web else [])
 print(json.dumps(apps))
 ' <<<"$CHANGED_FILES")"
 fi
